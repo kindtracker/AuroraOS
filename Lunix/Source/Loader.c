@@ -1,111 +1,181 @@
 #include <elf.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "Lunix.h"
+
+#define PAGE_SIZE 0x1000u
+#define PAGE_MASK (PAGE_SIZE - 1u)
+
 typedef struct {
-  unsigned char *Data;
+  uint8_t *Data;
   size_t Size;
 } FileType;
 
-static FileType ReadFile(const char *ProgramPath) {
-  FILE *FilePtr = fopen(ProgramPath, "rb");
-  if (!FilePtr) {
-    perror("fopen");
-    exit(1);
+static FileType ReadFile(const char *Path) {
+  FILE *File = fopen(Path, "rb");
+  if (!File)
+    return (FileType){0};
+
+  if (fseek(File, 0, SEEK_END) != 0) {
+    fclose(File);
+    return (FileType){0};
   }
 
-  fseek(FilePtr, 0, SEEK_END);
-  size_t Size = ftell(FilePtr);
-  fseek(FilePtr, 0, SEEK_SET);
-
-  unsigned char *Data = malloc(Size);
-  if (!Data || fread(Data, 1, Size, FilePtr) != Size) {
-    perror("fread");
-    fclose(FilePtr);
-    exit(1);
+  long FileSize = ftell(File);
+  if (FileSize <= 0) {
+    fclose(File);
+    return (FileType){0};
   }
 
-  fclose(FilePtr);
-  return (FileType){.Data = Data, .Size = Size};
+  if (fseek(File, 0, SEEK_SET) != 0) {
+    fclose(File);
+    return (FileType){0};
+  }
+
+  uint8_t *Data = malloc((size_t)FileSize);
+  if (!Data) {
+    fclose(File);
+    return (FileType){0};
+  }
+
+  if (fread(Data, 1, (size_t)FileSize, File) != (size_t)FileSize) {
+    free(Data);
+    fclose(File);
+    return (FileType){0};
+  }
+
+  fclose(File);
+
+  return (FileType){.Data = Data, .Size = (size_t)FileSize};
 }
 
-int LunixLoadProgram(const char *ProgramPath, uc_engine *Unicorn,
-                     uint64_t *Entry) {
+static uint64_t AlignDown(uint64_t Value) {
+  return Value & ~(uint64_t)PAGE_MASK;
+}
+
+static uint64_t AlignUp(uint64_t Value) {
+  return (Value + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+}
+
+int LunixLoadProgram(const char *ProgramPath, uint32_t *Entry) {
+  if (!ProgramPath || !Entry)
+    return LUNIX_NOT_OK;
+
   FileType File = ReadFile(ProgramPath);
-  if (File.Size < sizeof(Elf64_Ehdr)) {
-    free(File.Data);
-    return -1;
-  }
+  if (!File.Data)
+    return LUNIX_NOT_OK;
 
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)File.Data;
-  if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
-      eh->e_machine != EM_AARCH64) {
-    free(File.Data);
-    return -1;
-  }
+  int Result = LUNIX_NOT_OK;
+  void *Allocation = NULL;
 
-  Elf64_Phdr *phdrs = (Elf64_Phdr *)(File.Data + eh->e_phoff);
+  if (File.Size < sizeof(Elf32_Ehdr))
+    goto Cleanup;
 
-  uint64_t min_addr = UINT64_MAX;
-  uint64_t max_addr = 0;
-  for (int i = 0; i < eh->e_phnum; i++) {
-    Elf64_Phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_LOAD)
+  Elf32_Ehdr *Header = (Elf32_Ehdr *)File.Data;
+
+  if (memcmp(Header->e_ident, ELFMAG, SELFMAG) != 0)
+    goto Cleanup;
+
+  if (Header->e_ident[EI_CLASS] != ELFCLASS32 ||
+      Header->e_ident[EI_DATA] != ELFDATA2LSB ||
+      Header->e_ident[EI_VERSION] != EV_CURRENT ||
+      Header->e_machine != EM_ARM || Header->e_version != EV_CURRENT)
+    goto Cleanup;
+
+  if (Header->e_phentsize != sizeof(Elf32_Phdr))
+    goto Cleanup;
+
+  uint64_t PHDRStart = Header->e_phoff;
+  uint64_t PHDRSize = (uint64_t)Header->e_phnum * sizeof(Elf32_Phdr);
+
+  if (PHDRStart > File.Size || PHDRSize > File.Size - PHDRStart)
+    goto Cleanup;
+
+  Elf32_Phdr *PHDRs = (Elf32_Phdr *)(File.Data + Header->e_phoff);
+
+  uint64_t MinAddress = UINT64_MAX;
+  uint64_t MaxAddress = 0;
+
+  for (uint32_t i = 0; i < Header->e_phnum; i++) {
+    Elf32_Phdr *PH = &PHDRs[i];
+
+    if (PH->p_type != PT_LOAD || PH->p_memsz == 0)
       continue;
 
-    uint64_t addr = ph->p_vaddr & ~0xfffULL;
-    uint64_t end = (ph->p_vaddr + ph->p_memsz + 0xfff) & ~0xfffULL;
-    if (min_addr > addr)
-      min_addr = addr;
-    if (max_addr < end)
-      max_addr = end;
+    uint64_t SegmentEnd = (uint64_t)PH->p_vaddr + PH->p_memsz;
+
+    if (PH->p_filesz > PH->p_memsz || SegmentEnd > UINT32_MAX ||
+        (uint64_t)PH->p_offset + PH->p_filesz > File.Size)
+      goto Cleanup;
+
+    uint64_t Start = AlignDown(PH->p_vaddr);
+    uint64_t End = AlignUp(SegmentEnd);
+
+    if (Start < MinAddress)
+      MinAddress = Start;
+
+    if (End > MaxAddress)
+      MaxAddress = End;
   }
 
-  uc_err Error =
-      uc_mem_map(Unicorn, min_addr, max_addr - min_addr, UC_PROT_ALL);
-  if (Error != UC_ERR_OK) {
-    fprintf(stderr, "[Lunix] failed to map elf segment: %s\n",
-            uc_strerror(Error));
-    free(File.Data);
-    return -1;
-  }
+  if (MinAddress == UINT64_MAX || MaxAddress <= MinAddress)
+    goto Cleanup;
 
-  for (int i = 0; i < eh->e_phnum; i++) {
-    Elf64_Phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_LOAD)
+  uint64_t MemorySize = MaxAddress - MinAddress;
+
+  if (MemorySize > UINT32_MAX || MemorySize > SIZE_MAX - PAGE_MASK)
+    goto Cleanup;
+
+  size_t AllocationSize = (size_t)MemorySize + PAGE_MASK;
+
+  Allocation = malloc(AllocationSize);
+  if (!Allocation)
+    goto Cleanup;
+
+  uintptr_t RawAddress = (uintptr_t)Allocation;
+
+  uintptr_t PhysicalAddress = (RawAddress + PAGE_MASK) & ~(uintptr_t)PAGE_MASK;
+
+  if (PhysicalAddress > UINT32_MAX ||
+      (uint64_t)PhysicalAddress + MemorySize > (uint64_t)UINT32_MAX + 1)
+    goto Cleanup;
+
+  uint8_t *PhysicalMemory = (uint8_t *)PhysicalAddress;
+
+  // Clear the entire address range, including gaps and BSS.
+  memset(PhysicalMemory, 0, (size_t)MemorySize);
+
+  // Copy ELF segments into physical memory.
+  for (uint32_t i = 0; i < Header->e_phnum; i++) {
+    Elf32_Phdr *PH = &PHDRs[i];
+
+    if (PH->p_type != PT_LOAD || PH->p_memsz == 0)
       continue;
 
-    Error = uc_mem_write(Unicorn, ph->p_vaddr, File.Data + ph->p_offset,
-                         ph->p_filesz);
-    if (Error != UC_ERR_OK) {
-      fprintf(stderr, "[Lunix] failed to write elf segment: %s\n",
-              uc_strerror(Error));
-      free(File.Data);
-      return -1;
-    }
+    size_t Offset = PH->p_vaddr - (uint32_t)MinAddress;
 
-    if (ph->p_memsz > ph->p_filesz) {
-      uint8_t *Zero = calloc(1, ph->p_memsz - ph->p_filesz);
-      if (!Zero) {
-        free(File.Data);
-        return -1;
-      }
-
-      Error = uc_mem_write(Unicorn, ph->p_vaddr + ph->p_filesz, Zero,
-                           ph->p_memsz - ph->p_filesz);
-      free(Zero);
-
-      if (Error != UC_ERR_OK) {
-        fprintf(stderr, "[Lunix] failed to clear elf bss: %s\n",
-                uc_strerror(Error));
-        free(File.Data);
-        return -1;
-      }
-    }
+    memcpy(PhysicalMemory + Offset, File.Data + PH->p_offset, PH->p_filesz);
   }
 
-  *Entry = eh->e_entry;
+  if (!mmu_map((uint32_t)MinAddress, (uint32_t)PhysicalAddress,
+               (uint32_t)MemorySize, MAP_USER | MAP_PRIV)) {
+    fprintf(stderr, "[Lunix] Failed to map ELF memory\n");
+    goto Cleanup;
+  }
+
+  Allocation = NULL;
+
+  *Entry = Header->e_entry;
+
+  Result = LUNIX_OK;
+
+Cleanup:
+  free(Allocation);
   free(File.Data);
-  return 0;
+
+  return Result;
 }
